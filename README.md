@@ -1,7 +1,7 @@
-# espbliss: ESPHome config for Bliss Smart Blinds (ESP32-C6)
+# espbliss: ESPHome config for Bliss Smart Blinds (ESP32)
 
 An [ESPHome](https://esphome.io) configuration that controls **Hunter Douglas "Bliss Smart Blinds"**
-motors (BLE name `HDxxxx`, e.g. HD1300) from an **ESP32-C6** using the
+motors (BLE name `HDxxxx`, e.g. HD1300) from an **ESP32** using the
 [`ble_client`](https://esphome.io/components/ble_client/) component. The blind shows up in Home
 Assistant as a cover with position control, plus battery, speed and diagnostic entities.
 
@@ -46,11 +46,12 @@ accepts only one connection at a time. Keep the board close to the motor.
 - Not implemented: favorites, timers/schedules, clock sync.
 - The motor's protocol has no real authentication or encryption (a fixed password shared by all
   units), so anyone in Bluetooth range can control the blind. That is a property of the device.
+- The code is mostly AI generated.
 
 ## Status
 
 > **Only tested on an HD1300 blind.** This code has been tested with a single HD1300 motor, using
-> ESPHome 2026.10 on an ESP32-C6. Other Bliss/HD-series models are untested and may behave
+> ESPHome 2026.10 on an ESP32-C6 and a standard ESP32. Other Bliss/HD-series models are untested and may behave
 > differently (position range, status frame layout, etc.).
 
 ## License
