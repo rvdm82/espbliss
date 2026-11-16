@@ -1,0 +1,341 @@
+# ESPHome config: Hunter Douglas "Bliss Smart Blinds" motor (HDxxxx) on an ESP32-C6,
+# exposed as a template cover driven through ble_client.
+#
+# Protocol reference: https://github.com/viggfred/blissble#protocol-notes
+#   Service   00010203-0405-0607-0809-0a0b0c0d1910
+#   Command   00010405-...-1910  (write)   -> frames below
+#   Response  00010304-...-1910  (notify)  -> FF 01 02 03 <opcode> <payload>
+#   Flow: connect -> subscribe to Response -> login -> commands
+#
+# Battery motors: holding a BLE link open is the main battery cost, so this config
+# connects ON DEMAND (command / refresh), then drops the link after `idle_timeout`.
+
+substitutions:
+  name: bliss-blind
+  friendly_name: Bliss Blind
+  blind_mac: "AA:BB:CC:DD:EE:01"   # sticker inside the head rail / `bluetoothctl scan on` (name HDxxxx)
+  blind_range: "1000"              # position range: 1000 on HD1300-class motors, 100 on others
+  invert_position: "false"         # set "true" if open/closed end up swapped in Home Assistant
+  idle_timeout: 45s                # drop the BLE link after this long without commands
+  connect_attempts: "5"            # connect+login tries per command before giving up
+  attempt_timeout: 12s             # how long each try may take to reach "logged in"
+  refresh_interval: 30min          # periodic status read (connects briefly); battery vs. freshness
+
+  svc_uuid: "00010203-0405-0607-0809-0a0b0c0d1910"
+  cmd_uuid: "00010405-0405-0607-0809-0a0b0c0d1910"
+  rsp_uuid: "00010304-0405-0607-0809-0a0b0c0d1910"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - delay: 10s
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0xD1, 0x03, 0x01]   # read status
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf          # ESP32-C6 requires ESP-IDF
+
+logger:
+  level: DEBUG             # shows raw RX frames (tag "bliss"); lower to INFO once it works
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name} fallback"
+    password: !secret ap_password
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: ${blind_mac}
+    id: bliss_blind
+    # auto_connect MUST stay true: the connection then goes through the scanner, which learns the
+    # motor's RANDOM address type from its advertisement. (ble_client.connect with auto_connect:false
+    # connects blind with the default PUBLIC type -> status 133 every time.)
+    # Battery saving is done by enabling/disabling the client from send_cmd instead.
+    auto_connect: true
+    on_connect:
+      then:
+        # on_connect fires at service discovery, BEFORE the notify subscription is finished.
+        # Wait so the login reply (D4) isn't lost and the write isn't rejected as "not connected".
+        - delay: 1s
+        # Login: FF 03 03 03 03 + password. The app's universal password is "xxxxxx" (0x78 * 6).
+        - ble_client.ble_write:
+            id: bliss_blind
+            service_uuid: ${svc_uuid}
+            characteristic_uuid: ${cmd_uuid}
+            value: [0xFF, 0x03, 0x03, 0x03, 0x03, 0x78, 0x78, 0x78, 0x78, 0x78, 0x78]
+        # (Optional) some firmware/integrations send a clock sync right after login; if status
+        # replies never arrive, see "Set clock" in the protocol notes (needs a `time:` source).
+    on_disconnect:
+      then:
+        - lambda: id(logged_in) = false;
+
+globals:
+  - id: connect_attempt
+    type: int
+    initial_value: "0"
+  - id: logged_in
+    type: bool
+    initial_value: "false"
+  - id: cur_pos          # last device-reported position, 0..100 (-1 = unknown)
+    type: int
+    initial_value: "-1"
+  - id: prev_pos
+    type: int
+    initial_value: "-1"
+  - id: stable_polls
+    type: int
+    initial_value: "0"
+  - id: poll_count
+    type: int
+    initial_value: "0"
+
+script:
+  # Send one command frame, connecting + logging in first if needed.
+  - id: send_cmd
+    mode: queued
+    max_runs: 8
+    parameters:
+      frame: std::vector<int>
+    then:
+      # Retry loop: the motor's weak link often needs several attempts (status 133 / rsn 0x3e)
+      # before a connection sticks. Each attempt = connect (if needed) + wait for login (D4 OK).
+      - lambda: id(connect_attempt) = 0;
+      - while:
+          condition:
+            lambda: 'return !id(logged_in) && id(connect_attempt) < ${connect_attempts};'
+          then:
+            - lambda: |-
+                id(connect_attempt)++;
+                ESP_LOGD("bliss", "Connect attempt %d/%d", id(connect_attempt), ${connect_attempts});
+            - lambda: id(bliss_blind)->set_enabled(true);    # scan + connect (auto_connect path)
+            - wait_until:
+                condition:
+                  lambda: 'return id(logged_in);'
+                timeout: ${attempt_timeout}
+            - if:
+                condition:
+                  lambda: 'return !id(logged_in);'
+                then:
+                  - logger.log:
+                      level: WARN
+                      tag: bliss
+                      format: "Attempt failed (no link or no login); resetting before retry"
+                  - lambda: id(bliss_blind)->set_enabled(false);   # drop link, stop reconnecting
+                  - delay: 2s       # let the BLE stack settle before scanning/connecting again
+      - if:
+          condition:
+            lambda: 'return id(logged_in);'
+          then:
+            - ble_client.ble_write:
+                id: bliss_blind
+                service_uuid: ${svc_uuid}
+                characteristic_uuid: ${cmd_uuid}
+                value: !lambda |-
+                  std::vector<uint8_t> v(frame.begin(), frame.end());
+                  return v;
+            - script.execute: idle_disconnect
+          else:
+            - logger.log:
+                level: WARN
+                tag: bliss
+                format: "Blind unreachable after ${connect_attempts} attempts; command dropped"
+            - lambda: id(bliss_blind)->set_enabled(false);
+
+  # Drop the BLE link after a quiet period (restarted by every command).
+  - id: idle_disconnect
+    mode: restart
+    then:
+      - delay: ${idle_timeout}
+      - lambda: id(bliss_blind)->set_enabled(false);   # disconnect and stop auto-reconnecting
+
+  # The motor gives no live direction, so poll status while moving and mark the
+  # cover idle once the position has been stable for a few polls.
+  - id: track_motion
+    mode: restart
+    then:
+      - lambda: |-
+          id(stable_polls) = 0;
+          id(poll_count) = 0;
+          id(prev_pos) = -1;
+      - while:
+          condition:
+            lambda: 'return id(stable_polls) < 3;'
+          then:
+            - script.execute:
+                id: send_cmd
+                frame: [0xFF, 0x58, 0xEA, 0x41, 0xD1, 0x03, 0x01]   # read status
+            - delay: 1500ms
+            - lambda: |-
+                if (id(cur_pos) == id(prev_pos)) id(stable_polls)++;
+                else id(stable_polls) = 0;
+                id(prev_pos) = id(cur_pos);
+                if (++id(poll_count) > 60) id(stable_polls) = 3;   // safety timeout (~90 s)
+      - lambda: |-
+          id(bliss_cover).current_operation = cover::COVER_OPERATION_IDLE;
+          id(bliss_cover).publish_state(false);
+
+cover:
+  - platform: template
+    name: "Blind"
+    id: bliss_cover
+    device_class: shade
+    has_position: true
+    optimistic: false      # position comes from the motor's own status reports
+    open_action:           # Up / open:   FF 58 EA 41 CF 03 01
+      - cover.template.publish:
+          id: bliss_cover
+          current_operation: OPENING
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0xCF, 0x03, 0x01]
+      - script.execute: track_motion
+    close_action:          # Down / close: FF 58 EA 41 1F 03 01
+      - cover.template.publish:
+          id: bliss_cover
+          current_operation: CLOSING
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0x1F, 0x03, 0x01]
+      - script.execute: track_motion
+    stop_action:           # Stop:        FF 58 EA 41 5F 03 01
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0x5F, 0x03, 0x01]
+    position_action:       # Go to position: FF 58 EA 41 BF 03 + position (16-bit LE if range > 100)
+      - lambda: |-
+          id(bliss_cover).current_operation = (pos > id(bliss_cover).position)
+              ? cover::COVER_OPERATION_OPENING : cover::COVER_OPERATION_CLOSING;
+          id(bliss_cover).publish_state(false);
+      - script.execute:
+          id: send_cmd
+          frame: !lambda |-
+            float dev = ${invert_position} ? (1.0f - pos) : pos;
+            int raw = (int) roundf(dev * ${blind_range});
+            std::vector<int> f = {0xFF, 0x58, 0xEA, 0x41, 0xBF, 0x03};
+            if (${blind_range} > 100) {
+              f.push_back(raw & 0xFF);          // e.g. 50% -> 500 -> F4 01
+              f.push_back((raw >> 8) & 0xFF);
+            } else {
+              f.push_back(raw & 0xFF);
+            }
+            return f;
+      - script.execute: track_motion
+
+sensor:
+  # Single notification subscription on the Response characteristic. The lambda parses every
+  # frame (header FF 01 02 03, opcode at x[4]); offsets below are relative to the opcode byte.
+  - platform: ble_client
+    ble_client_id: bliss_blind
+    type: characteristic
+    id: bliss_status
+    name: "Blind position (device)"
+    entity_category: diagnostic
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    service_uuid: ${svc_uuid}
+    characteristic_uuid: ${rsp_uuid}
+    notify: true
+    update_interval: never
+    lambda: |-
+      ESP_LOGD("bliss", "RX %s", format_hex_pretty(x).c_str());
+      if (x.size() < 7 || x[0] != 0xFF || x[1] != 0x01 || x[2] != 0x02 || x[3] != 0x03)
+        return {};
+      const uint8_t op = x[4];
+      if (op == 0xD4) {                       // login result: byte[2] > 0 => success
+        id(logged_in) = x[6] > 0;
+        ESP_LOGI("bliss", "Login %s", id(logged_in) ? "OK" : "REJECTED");
+        return {};
+      }
+      if (op != 0xD1 && op != 0xD2) return {};  // D1/D2 = status (same layout)
+      const uint8_t flags = x[5];               // byte[1]
+      int pct = x[6];                           // byte[2] = position %
+      if (pct > 100) pct = 100;
+      id(cur_pos) = pct;
+      const uint8_t batt = flags & 0x18;        // 0x00 normal, 0x08 low, 0x10 none
+      id(bliss_battery).publish_state(batt == 0x10 ? "none" : (batt == 0x08 ? "low" : "normal"));
+      id(bliss_cover).position = (${invert_position} ? (100 - pct) : pct) / 100.0f;
+      id(bliss_cover).publish_state(false);
+      return (float) pct;
+
+text_sensor:
+  - platform: template
+    id: bliss_battery
+    name: "Battery"
+    icon: mdi:battery
+
+binary_sensor:
+  - platform: template
+    name: "BLE connected"
+    entity_category: diagnostic
+    lambda: 'return id(bliss_blind)->connected();'
+
+select:
+  # Motor speed preset: FF 58 EA 41 F0/F1/F2/F3 03 01 = 100 / 75 / 50 / 25 %.
+  # The status frame doesn't report speed, so this is optimistic (remembers the last value set).
+  - platform: template
+    name: "Speed"
+    id: bliss_speed
+    icon: mdi:speedometer
+    options:
+      - "100%"
+      - "75%"
+      - "50%"
+      - "25%"
+    initial_option: "100%"
+    optimistic: true
+    restore_value: true
+    set_action:
+      - script.execute:
+          id: send_cmd
+          frame: !lambda |-
+            uint8_t code = 0xF0;                       // 100%
+            if (x == "75%") code = 0xF1;
+            else if (x == "50%") code = 0xF2;
+            else if (x == "25%") code = 0xF3;
+            return std::vector<int>{0xFF, 0x58, 0xEA, 0x41, code, 0x03, 0x01};
+
+button:
+  - platform: template
+    name: "Refresh"
+    entity_category: diagnostic
+    on_press:
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0xD1, 0x03, 0x01]
+  - platform: template
+    name: "Slow up"          # fine/precision step
+    on_press:
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0x22, 0x03, 0x01]
+  - platform: template
+    name: "Slow down"
+    on_press:
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0x23, 0x03, 0x01]
+
+interval:
+  - interval: ${refresh_interval}
+    then:
+      - script.execute:
+          id: send_cmd
+          frame: [0xFF, 0x58, 0xEA, 0x41, 0xD1, 0x03, 0x01]
